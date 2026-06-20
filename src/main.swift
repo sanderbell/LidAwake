@@ -73,8 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusMenuItem = NSMenuItem(title: "Checking...", action: nil, keyEquivalent: "")
     private let toggleMenuItem = NSMenuItem(title: "Keep Awake", action: #selector(toggleNoSleep), keyEquivalent: "")
     private let refreshMenuItem = NSMenuItem(title: "Refresh", action: #selector(refreshFromMenu), keyEquivalent: "r")
-    private let launchAtLoginMenuItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
-    private let setupMenuItem = NSMenuItem(title: "Set Up Helper...", action: #selector(runSetup), keyEquivalent: "")
+    private let launchAtLoginMenuItem = NSMenuItem(title: "Open at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
     private let quitMenuItem = NSMenuItem(title: "Quit Lid Awake", action: #selector(quit), keyEquivalent: "q")
 
     private var state: NoSleepState = .unknown("Checking")
@@ -118,7 +117,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleMenuItem.target = self
         refreshMenuItem.target = self
         launchAtLoginMenuItem.target = self
-        setupMenuItem.target = self
         quitMenuItem.target = self
 
         menu.addItem(statusMenuItem)
@@ -126,7 +124,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toggleMenuItem)
         menu.addItem(refreshMenuItem)
         menu.addItem(launchAtLoginMenuItem)
-        menu.addItem(setupMenuItem)
         menu.addItem(.separator())
         menu.addItem(quitMenuItem)
 
@@ -170,7 +167,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleMenuItem.isEnabled = !isBusy
         refreshMenuItem.isEnabled = !isBusy
         launchAtLoginMenuItem.isEnabled = !isBusy
-        setupMenuItem.isEnabled = !isBusy
     }
 
     private func setBusy(_ busy: Bool, message: String? = nil) {
@@ -195,35 +191,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func refreshFromMenu() {
         refreshStatus()
-    }
-
-    @objc private func runSetup() {
-        let alert = NSAlert()
-        alert.messageText = "Set up Lid Awake helper?"
-        alert.informativeText = "This lets Touch ID toggles run without a password. Permission is limited to lid sleep on/off."
-        alert.addButton(withTitle: "Set Up")
-        alert.addButton(withTitle: "Cancel")
-
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            return
-        }
-
-        setBusy(true, message: "Running setup")
-        installHelper { [weak self] result in
-            guard let self else {
-                return
-            }
-
-            if result.exitCode == 0 {
-                self.lastMessage = "Setup complete"
-            } else {
-                self.lastMessage = "Setup failed: \(Self.oneLine(result.output))"
-            }
-
-            self.setBusy(false)
-            self.refreshStatus(silent: true)
-        }
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -300,8 +267,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.lastMessage = enabled ? "Turned on with Touch ID" : "Turned off with Touch ID"
                         self.refreshStatus(silent: true)
                     } else {
-                        self.lastMessage = "Touch ID ok, sudo rule failed"
-                        self.setNoSleepWithAdminFallback(enabled: enabled)
+                        self.lastMessage = "Permission needed"
+                        self.offerTouchIDToggleSetup(enabled: enabled)
                     }
                 }
                 return
@@ -316,6 +283,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             self.setNoSleepWithAdminFallback(enabled: enabled)
+        }
+    }
+
+    private func offerTouchIDToggleSetup(enabled: Bool) {
+        let alert = NSAlert()
+        alert.messageText = "Enable Touch ID toggles?"
+        alert.informativeText = "Enter your password once so Lid Awake can toggle lid sleep with Touch ID next time. Permission is limited to lid sleep on/off."
+        alert.addButton(withTitle: "Enable")
+        alert.addButton(withTitle: "Use Password Once")
+        alert.addButton(withTitle: "Cancel")
+
+        NSApp.activate(ignoringOtherApps: true)
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            setBusy(true, message: "Enabling Touch ID")
+            installPermissionAndRetry(enabled: enabled)
+        case .alertSecondButtonReturn:
+            setNoSleepWithAdminFallback(enabled: enabled)
+        default:
+            setBusy(false)
+        }
+    }
+
+    private func installPermissionAndRetry(enabled: Bool) {
+        installPermission { [weak self] result in
+            guard let self else {
+                return
+            }
+
+            self.lastOutput = Self.oneLine(result.output)
+            Self.appendLog("permission install exit=\(result.exitCode) output=\(Self.oneLine(result.output))")
+
+            guard result.exitCode == 0 else {
+                self.lastMessage = "Permission setup failed"
+                self.setBusy(false)
+                return
+            }
+
+            self.setNoSleepWithPasswordlessSudo(enabled: enabled) { [weak self] retryResult in
+                guard let self else {
+                    return
+                }
+
+                self.lastOutput = Self.oneLine(retryResult.output)
+                Self.appendLog("permission retry pmset \(enabled ? "on" : "off") exit=\(retryResult.exitCode) output=\(Self.oneLine(retryResult.output))")
+
+                if retryResult.exitCode == 0 {
+                    self.lastMessage = enabled ? "Keeping awake" : "Normal sleep"
+                    self.refreshStatus(silent: true)
+                } else {
+                    self.lastMessage = "Permission setup failed"
+                    self.setBusy(false)
+                }
+            }
         }
     }
 
@@ -354,9 +375,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func installHelper(completion: @escaping (CommandResult) -> Void) {
+    private func installPermission(completion: @escaping (CommandResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Self.runCommandWithAdministratorPrivileges(command: Self.installHelperCommand())
+            let result = Self.runCommandWithAdministratorPrivileges(command: Self.installPermissionCommand())
 
             DispatchQueue.main.async {
                 completion(result)
@@ -433,7 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return run(process)
     }
 
-    private static func installHelperCommand() -> String {
+    private static func installPermissionCommand() -> String {
         let user = NSUserName()
         let rule = "\(user) ALL=(ALL) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
 
