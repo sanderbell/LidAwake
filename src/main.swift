@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import LocalAuthentication
+import ServiceManagement
 
 enum NoSleepState {
     case on
@@ -72,6 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusMenuItem = NSMenuItem(title: "Checking...", action: nil, keyEquivalent: "")
     private let toggleMenuItem = NSMenuItem(title: "Keep Awake", action: #selector(toggleNoSleep), keyEquivalent: "")
     private let refreshMenuItem = NSMenuItem(title: "Refresh", action: #selector(refreshFromMenu), keyEquivalent: "r")
+    private let launchAtLoginMenuItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
     private let setupMenuItem = NSMenuItem(title: "Set Up Helper...", action: #selector(runSetup), keyEquivalent: "")
     private let quitMenuItem = NSMenuItem(title: "Quit Lid Awake", action: #selector(quit), keyEquivalent: "q")
 
@@ -80,12 +82,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastMessage = "Starting up"
     private var lastOutput = "none"
     private var refreshTimer: Timer?
-    private let scriptPath: String?
-
-    override init() {
-        scriptPath = Self.findScriptPath()
-        super.init()
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -121,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         toggleMenuItem.target = self
         refreshMenuItem.target = self
+        launchAtLoginMenuItem.target = self
         setupMenuItem.target = self
         quitMenuItem.target = self
 
@@ -128,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(toggleMenuItem)
         menu.addItem(refreshMenuItem)
+        menu.addItem(launchAtLoginMenuItem)
         menu.addItem(setupMenuItem)
         menu.addItem(.separator())
         menu.addItem(quitMenuItem)
@@ -167,11 +165,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateMenu() {
         statusMenuItem.title = isBusy ? "Updating..." : state.statusTitle
         toggleMenuItem.title = isBusy ? "Working..." : state.toggleTitle
+        launchAtLoginMenuItem.state = Self.launchAtLoginEnabled() ? .on : .off
 
-        let hasScript = scriptPath != nil
         toggleMenuItem.isEnabled = !isBusy
         refreshMenuItem.isEnabled = !isBusy
-        setupMenuItem.isEnabled = hasScript && !isBusy
+        launchAtLoginMenuItem.isEnabled = !isBusy
+        setupMenuItem.isEnabled = !isBusy
     }
 
     private func setBusy(_ busy: Bool, message: String? = nil) {
@@ -201,7 +200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func runSetup() {
         let alert = NSAlert()
         alert.messageText = "Set up Lid Awake helper?"
-        alert.informativeText = "This allows Touch ID toggles. Permission is limited to lid sleep on/off."
+        alert.informativeText = "This lets Touch ID toggles run without a password. Permission is limited to lid sleep on/off."
         alert.addButton(withTitle: "Set Up")
         alert.addButton(withTitle: "Cancel")
 
@@ -211,7 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setBusy(true, message: "Running setup")
-        runScript(arguments: ["setup"], asAdmin: true) { [weak self] result in
+        installHelper { [weak self] result in
             guard let self else {
                 return
             }
@@ -225,6 +224,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.setBusy(false)
             self.refreshStatus(silent: true)
         }
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        do {
+            if Self.launchAtLoginEnabled() {
+                try SMAppService.mainApp.unregister()
+                lastMessage = "Login launch off"
+                Self.appendLog("launch-at-login disabled")
+            } else {
+                try SMAppService.mainApp.register()
+                lastMessage = "Login launch on"
+                Self.appendLog("launch-at-login enabled")
+            }
+        } catch {
+            lastMessage = "Login launch failed"
+            lastOutput = Self.oneLine(error.localizedDescription)
+            Self.appendLog("launch-at-login failed output=\(Self.oneLine(error.localizedDescription))")
+        }
+
+        updateMenu()
     }
 
     @objc private func quit() {
@@ -335,16 +354,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func runScript(arguments: [String], asAdmin: Bool, completion: @escaping (CommandResult) -> Void) {
-        guard let scriptPath else {
-            completion(CommandResult(output: "nosleep.sh not found", exitCode: 127))
-            return
-        }
-
+    private func installHelper(completion: @escaping (CommandResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = asAdmin
-                ? Self.runWithAdministratorPrivileges(scriptPath: scriptPath, arguments: arguments)
-                : Self.runDirectly(scriptPath: scriptPath, arguments: arguments)
+            let result = Self.runCommandWithAdministratorPrivileges(command: Self.installHelperCommand())
 
             DispatchQueue.main.async {
                 completion(result)
@@ -406,26 +418,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private static func runDirectly(scriptPath: String, arguments: [String]) -> CommandResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [scriptPath] + arguments
-        return run(process)
-    }
-
-    private static func runWithAdministratorPrivileges(scriptPath: String, arguments: [String]) -> CommandResult {
-        runCommandWithAdministratorPrivileges(executablePath: "/bin/bash", arguments: [scriptPath] + arguments)
-    }
-
     private static func runCommandWithAdministratorPrivileges(executablePath: String, arguments: [String]) -> CommandResult {
         let commandParts = [executablePath] + arguments
         let command = commandParts.map(shellQuote).joined(separator: " ")
+        return runCommandWithAdministratorPrivileges(command: command)
+    }
+
+    private static func runCommandWithAdministratorPrivileges(command: String) -> CommandResult {
         let appleScript = "do shell script \(appleScriptString(command)) with administrator privileges"
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", appleScript]
         return run(process)
+    }
+
+    private static func installHelperCommand() -> String {
+        let user = NSUserName()
+        let rule = "\(user) ALL=(ALL) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
+
+        return [
+            "tmp=$(/usr/bin/mktemp /tmp/lid-awake-sudoers.XXXXXX)",
+            "/usr/bin/printf '%s\\n' \(shellQuote(rule)) > \"$tmp\"",
+            "/usr/sbin/visudo -cf \"$tmp\"",
+            "/bin/chmod 440 \"$tmp\"",
+            "/usr/sbin/chown root:wheel \"$tmp\"",
+            "/bin/mv \"$tmp\" /etc/sudoers.d/lid-awake"
+        ].joined(separator: " && ")
     }
 
     private static func run(_ process: Process) -> CommandResult {
@@ -496,6 +515,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             && context.biometryType == .touchID
     }
 
+    private static func launchAtLoginEnabled() -> Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
     private static func touchIDUnavailableMessage(_ error: NSError?) -> String {
         guard let error else {
             return "Touch ID unavailable"
@@ -539,18 +562,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             try? data.write(to: logURL)
         }
-    }
-
-    private static func findScriptPath() -> String? {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let candidates = [
-            "\(home)/Terminal/scripts/nosleep.sh",
-            "\(home)/Terminal/Scripts/nosleep.sh",
-            "/Users/sanderbell/Terminal/scripts/nosleep.sh",
-            "/Users/sanderbell/Terminal/Scripts/nosleep.sh"
-        ]
-
-        return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }
 
     private static func shellQuote(_ value: String) -> String {

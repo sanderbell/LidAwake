@@ -14,7 +14,8 @@ mkdir -p "${APP_DIR}/Contents/MacOS" "${RESOURCES_DIR}"
   "${SCRIPT_DIR}/src/main.swift" \
   -o "${EXECUTABLE}" \
   -framework AppKit \
-  -framework LocalAuthentication
+  -framework LocalAuthentication \
+  -framework ServiceManagement
 
 /usr/bin/swift "${SCRIPT_DIR}/tools/make_icon.swift" "${SCRIPT_DIR}" >/dev/null
 /usr/bin/iconutil -c icns "${ICONSET_DIR}" -o "${ICON_FILE}"
